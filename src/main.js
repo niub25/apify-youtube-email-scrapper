@@ -1,119 +1,74 @@
 /**
  * YouTube Channel Email Scraper
  * ─────────────────────────────
- * Scrapes the "business email" hidden behind a reCAPTCHA on YouTube channel pages.
+ * Clicks "...more" on the channel page → popup opens → clicks "View email address"
+ * → solves reCAPTCHA → extracts email.
  *
- * HOW THE POPUP WORKS:
- * On the channel page, clicking "...more" in the description area opens a popup.
- * That popup has a "More info" section containing the "View email address" button.
- * This button is only visible to logged-in users — valid session cookies required.
+ * Cookies are injected BEFORE navigation via preNavigationHooks so the page
+ * loads already logged-in — no second page.goto needed.
  */
 
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler, Dataset } from 'crawlee';
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
 const cleanHandle = (h) => h.replace(/^@/, '').trim();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function saveDebugScreenshot(page, label) {
+async function snap(page, label) {
     try {
-        const buf = await page.screenshot({ fullPage: false });
-        await Actor.setValue(`screenshot-${label}`, buf, { contentType: 'image/png' });
-        log.info(`📸 Screenshot saved: screenshot-${label}`);
+        await Actor.setValue(`ss-${label}`, await page.screenshot({ fullPage: false }), { contentType: 'image/png' });
+        log.info(`📸 ${label}`);
     } catch (_) {}
 }
 
+async function pushResult(handle, channelUrl, email, status) {
+    await Dataset.pushData({ handle: `@${cleanHandle(handle)}`, channelUrl, email, status, scrapedAt: new Date().toISOString() });
+}
+
 async function solveWith2Captcha(page, apiKey) {
-    log.info('Attempting 2captcha solve...');
-    let siteKey = await page.evaluate(() => {
-        const el = document.querySelector('[data-sitekey]') || document.querySelector('.g-recaptcha');
-        return el?.getAttribute('data-sitekey') ?? null;
-    });
+    let siteKey = await page.evaluate(() => document.querySelector('[data-sitekey]')?.getAttribute('data-sitekey') ?? null);
     if (!siteKey) {
-        const src = await page.locator('iframe[src*="recaptcha"]').first().getAttribute('src').catch(() => null);
-        const m = src?.match(/[?&]k=([^&]+)/);
-        if (!m) { log.warning('No reCAPTCHA site key found'); return null; }
+        const src = await page.locator('iframe[src*="recaptcha"]').first().getAttribute('src').catch(() => '');
+        const m = src.match(/[?&]k=([^&]+)/);
+        if (!m) return null;
         siteKey = m[1];
     }
     const pageUrl = page.url();
-    try {
-        const res = await fetch(`https://2captcha.com/in.php?key=${apiKey}&method=userrecaptcha&googlekey=${siteKey}&pageurl=${encodeURIComponent(pageUrl)}&json=1`);
-        const data = await res.json();
-        if (data.status !== 1) { log.error('2captcha submit failed', data); return null; }
-        const id = data.request;
-        log.info(`2captcha task id=${id}, polling...`);
-        for (let i = 0; i < 36; i++) {
-            await sleep(5000);
-            const r = await (await fetch(`https://2captcha.com/res.php?key=${apiKey}&action=get&id=${id}&json=1`)).json();
-            if (r.status === 1) { log.info('2captcha solved!'); return r.request; }
-            if (r.request !== 'CAPCHA_NOT_READY') { log.error('2captcha error', r); return null; }
-        }
-        log.error('2captcha timed out'); return null;
-    } catch (err) { log.error('2captcha threw', { message: err.message }); return null; }
+    const sub = await (await fetch(`https://2captcha.com/in.php?key=${apiKey}&method=userrecaptcha&googlekey=${siteKey}&pageurl=${encodeURIComponent(pageUrl)}&json=1`)).json();
+    if (sub.status !== 1) return null;
+    for (let i = 0; i < 36; i++) {
+        await sleep(5000);
+        const r = await (await fetch(`https://2captcha.com/res.php?key=${apiKey}&action=get&id=${sub.request}&json=1`)).json();
+        if (r.status === 1) return r.request;
+        if (r.request !== 'CAPCHA_NOT_READY') return null;
+    }
+    return null;
 }
 
-async function injectCaptchaToken(page, token) {
-    await page.evaluate((t) => {
-        const area = document.querySelector('#g-recaptcha-response');
-        if (area) {
-            Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set.call(area, t);
-            area.dispatchEvent(new Event('input', { bubbles: true }));
-        }
-        try {
-            if (window.___grecaptcha_cfg?.clients) {
-                const find = (obj, d = 0) => {
-                    if (d > 5 || !obj || typeof obj !== 'object') return null;
-                    for (const k of Object.keys(obj)) {
-                        if (k === 'callback' && typeof obj[k] === 'function') return obj[k];
-                        const f = find(obj[k], d + 1); if (f) return f;
-                    }
-                    return null;
-                };
-                for (const ck of Object.keys(window.___grecaptcha_cfg.clients)) {
-                    const cb = find(window.___grecaptcha_cfg.clients[ck]);
-                    if (cb) { cb(t); return; }
-                }
-            }
-        } catch (_) {}
-    }, token);
-}
-
-async function pushResult(handle, channelUrl, email, status) {
-    await Dataset.pushData({
-        handle: `@${cleanHandle(handle)}`,
-        channelUrl,
-        email,
-        status,
-        scrapedAt: new Date().toISOString(),
-    });
-}
-
-// ─── Main ────────────────────────────────────────────────────────────────────
+// ─── Init ────────────────────────────────────────────────────────────────────
 
 await Actor.init();
-
 const input = await Actor.getInput() ?? {};
-const {
-    channelHandles = [],
-    cookies = [],
-    twoCaptchaApiKey = '',
-    proxyConfiguration: proxyConfigInput,
-    maxConcurrency = 1,
-    delayBetweenRequests = 2000,
-} = input;
+const { channelHandles = [], cookies = [], twoCaptchaApiKey = '', proxyConfiguration: proxyConfigInput, maxConcurrency = 1, delayBetweenRequests = 2000 } = input;
 
 if (!channelHandles.length) throw new Error('"channelHandles" is empty');
-if (!cookies.length) log.warning('No cookies — email button only shows to logged-in users');
+if (!cookies.length) log.warning('No cookies provided — email button only visible to logged-in users');
 
-const proxyConfiguration = proxyConfigInput
-    ? await Actor.createProxyConfiguration(proxyConfigInput)
-    : undefined;
+const proxyConfiguration = proxyConfigInput ? await Actor.createProxyConfiguration(proxyConfigInput) : undefined;
 
-const sameSiteMap = {
-    no_restriction: 'None', lax: 'Lax', strict: 'Strict', unspecified: 'Lax', '': 'Lax',
-};
+const sameSiteMap = { no_restriction: 'None', lax: 'Lax', strict: 'Strict', unspecified: 'Lax', '': 'Lax' };
+
+function normaliseCookies(raw) {
+    return raw.map((c) => {
+        const s = (c.sameSite ?? '').toLowerCase();
+        return {
+            name: c.name, value: c.value,
+            domain: c.domain ?? '.youtube.com', path: c.path ?? '/',
+            secure: c.secure ?? true, httpOnly: c.httpOnly ?? false,
+            sameSite: sameSiteMap[s] ?? (['Strict', 'Lax', 'None'].includes(c.sameSite) ? c.sameSite : 'None'),
+        };
+    });
+}
 
 // ─── Crawler ─────────────────────────────────────────────────────────────────
 
@@ -123,10 +78,14 @@ const crawler = new PlaywrightCrawler({
     navigationTimeoutSecs: 120,
     requestHandlerTimeoutSecs: 300,
 
+    // Inject cookies BEFORE Crawlee navigates — no re-navigation needed
     preNavigationHooks: [
-        async (_ctx, gotoOptions) => {
+        async ({ page }, gotoOptions) => {
             gotoOptions.waitUntil = 'domcontentloaded';
             gotoOptions.timeout = 120_000;
+            if (cookies.length) {
+                await page.context().addCookies(normaliseCookies(cookies)).catch(() => {});
+            }
         },
     ],
 
@@ -134,232 +93,184 @@ const crawler = new PlaywrightCrawler({
         useChrome: Actor.isAtHome(),
         launchOptions: {
             headless: true,
-            args: [
-                '--disable-blink-features=AutomationControlled',
-                '--no-sandbox',
-                '--disable-dev-shm-usage',
-                '--window-size=1280,800',
-            ],
+            args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage', '--window-size=1280,800'],
         },
     },
 
     browserPoolOptions: {
         useFingerprints: true,
-        fingerprintOptions: {
-            fingerprintGeneratorOptions: { browsers: ['chrome'], operatingSystems: ['windows', 'macos'] },
-        },
+        fingerprintOptions: { fingerprintGeneratorOptions: { browsers: ['chrome'], operatingSystems: ['windows', 'macos'] } },
     },
 
-    async requestHandler({ page, request, log: reqLog }) {
+    async requestHandler({ page, request, log: L }) {
         const { handle } = request.userData;
         const ch = cleanHandle(handle);
         const channelUrl = `https://www.youtube.com/@${ch}`;
-        reqLog.info(`▶ Processing @${ch}`);
+        L.info(`▶ @${ch}`);
 
-        // ── 1. Inject cookies ────────────────────────────────────────────────
-        if (cookies.length) {
-            const normalised = cookies.map((c) => {
-                const raw = (c.sameSite ?? '').toLowerCase();
-                const sameSite = sameSiteMap[raw] ??
-                    (['Strict', 'Lax', 'None'].includes(c.sameSite) ? c.sameSite : 'None');
-                return {
-                    name: c.name, value: c.value,
-                    domain: c.domain ?? '.youtube.com', path: c.path ?? '/',
-                    secure: c.secure ?? true, httpOnly: c.httpOnly ?? false, sameSite,
-                };
-            });
-            await page.context().addCookies(normalised);
-            reqLog.info(`Injected ${normalised.length} cookies`);
-        }
-
-        // ── 2. Passive network monitor ───────────────────────────────────────
+        // ── Network monitor (passive — no re-fetching) ───────────────────────
         let interceptedEmail = null;
-        page.on('response', async (response) => {
+        page.on('response', async (res) => {
             try {
-                const url = response.url();
-                if (!url.includes('youtubei/v1/')) return;
-                const ct = response.headers()['content-type'] ?? '';
-                if (!ct.includes('application/json')) return;
-                const body = await response.text().catch(() => '');
+                if (!res.url().includes('youtubei/v1/')) return;
+                if (!(res.headers()['content-type'] ?? '').includes('application/json')) return;
+                const body = await res.text().catch(() => '');
                 if (interceptedEmail || !body.includes('@')) return;
-                const m = body.match(
-                    /[a-zA-Z0-9._%+\-]+@(?!youtube\.|google\.|gstatic\.|googleapis\.|w3\.|schema\.|gzip\.|example\.|sentry\.)[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/
-                );
-                if (m) {
-                    interceptedEmail = m[0];
-                    reqLog.info(`📡 Intercepted email from API: ${interceptedEmail}`);
-                }
+                const m = body.match(/[a-zA-Z0-9._%+\-]+@(?!youtube\.|google\.|gstatic\.|googleapis\.|w3\.|schema\.|gzip\.|example\.|sentry\.)[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
+                if (m) { interceptedEmail = m[0]; L.info(`📡 Network email: ${interceptedEmail}`); }
             } catch (_) {}
         });
 
-        // ── 3. Navigate with cookies ─────────────────────────────────────────
-        await page.goto(channelUrl, { waitUntil: 'domcontentloaded', timeout: 120_000 });
-        await sleep(4000); // let YouTube's JS fully render
+        // ── Wait for YouTube to render channel content ───────────────────────
+        // Cookies were already injected before this navigation — no second goto needed
+        await sleep(2000);
 
-        const isLoggedIn = await page.evaluate(() =>
-            !!document.querySelector('#avatar-btn') || document.cookie.includes('SID')
-        );
-        reqLog.info(isLoggedIn ? '✅ Logged in' : '⚠️  Not logged in');
-        await saveDebugScreenshot(page, `${ch}-01-loaded`);
+        // Wait for the channel header or app shell to appear
+        await page.waitForSelector('ytd-app, ytd-page-manager', { timeout: 30_000 }).catch(() => null);
+        await sleep(3000);
 
-        // ── 4. Click "...more" to open the channel info popup ─────────────────
+        const isLoggedIn = await page.evaluate(() => !!document.querySelector('#avatar-btn') || document.cookie.includes('SID'));
+        L.info(isLoggedIn ? '✅ Logged in' : '⚠️  Not logged in');
+        await snap(page, `${ch}-01-loaded`);
+
+        // ── Click "...more" via JavaScript ───────────────────────────────────
         //
-        // The popup with "View email address" opens when you click "...more"
-        // in the channel description area on the channel home page.
+        // YouTube's "more" button is a web component (tp-yt-paper-button).
+        // We click it via JS to bypass Playwright's visibility requirements.
+        // The button is inside ytd-text-inline-expander with id="expand".
         //
-        const moreButtonSelectors = [
-            // The expandable description "...more" button
-            'ytd-text-inline-expander tp-yt-paper-button#expand',
-            'ytd-text-inline-expander #expand',
-            '#description-container #expand',
-            'tp-yt-paper-button#expand',
-            // Text-based fallbacks
-            'button:has-text("more")',
-            '[aria-label="See more"]',
-            // The channel metadata / about section itself
-            'ytd-channel-about-metadata-renderer',
-            '#channel-metadata-editor',
-            // Clicking the description text area
-            '#channel-description-container',
-            '#description',
-        ];
+        const popupOpened = await page.evaluate(async () => {
+            const wait = (ms) => new Promise(r => setTimeout(r, ms));
 
-        let popupOpened = false;
-        for (const sel of moreButtonSelectors) {
-            try {
-                const el = page.locator(sel).first();
-                if (await el.isVisible({ timeout: 2000 })) {
-                    await el.click({ timeout: 4000 });
-                    reqLog.info(`Clicked: ${sel}`);
-                    await sleep(2500);
+            // Scroll down slightly so channel description comes into view
+            window.scrollBy(0, 300);
+            await wait(1000);
 
-                    // Check if popup with "View email address" appeared
-                    const emailBtnVisible = await page
-                        .getByRole('button', { name: /view email address/i })
-                        .first()
-                        .isVisible({ timeout: 2000 })
-                        .catch(() => false);
+            const candidates = [
+                // Primary: the expand button in the channel description
+                document.querySelector('ytd-text-inline-expander #expand'),
+                document.querySelector('ytd-text-inline-expander tp-yt-paper-button'),
+                document.querySelector('#description-container #expand'),
+                document.querySelector('tp-yt-paper-button#expand'),
+                // The channel metadata renderer itself sometimes triggers the popup
+                document.querySelector('ytd-channel-about-metadata-renderer'),
+                // Any element containing "more" text in the description area
+                ...Array.from(document.querySelectorAll('tp-yt-paper-button')).filter(el =>
+                    el.textContent.toLowerCase().includes('more') && el.offsetParent !== null
+                ),
+            ].filter(Boolean);
 
-                    if (emailBtnVisible) {
-                        reqLog.info(`✅ Popup opened and email button visible via: ${sel}`);
-                        popupOpened = true;
-                        break;
-                    }
+            for (const el of candidates) {
+                try {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    await wait(500);
+                    el.click();
+                    await wait(2000);
 
-                    // Also check for "More info" text as a proxy
-                    const moreInfoVisible = await page
-                        .getByText('More info', { exact: true })
-                        .first()
-                        .isVisible({ timeout: 1500 })
-                        .catch(() => false);
+                    // Check if popup appeared — look for "View email address" text
+                    const emailBtn = document.body.innerText.toLowerCase().includes('view email address');
+                    const moreInfo = document.body.innerText.toLowerCase().includes('more info');
+                    if (emailBtn || moreInfo) return `clicked: ${el.tagName}#${el.id}`;
+                } catch (_) {}
+            }
+            return null;
+        });
 
-                    if (moreInfoVisible) {
-                        reqLog.info(`✅ "More info" section visible via: ${sel}`);
-                        popupOpened = true;
-                        break;
-                    }
-                }
-            } catch (_) {}
-        }
-
-        await saveDebugScreenshot(page, `${ch}-02-after-more-click`);
+        L.info(popupOpened ? `✅ Popup opened (${popupOpened})` : '❌ Popup not opened');
+        await snap(page, `${ch}-02-popup`);
 
         if (!popupOpened) {
-            // Log all buttons on page to help identify the correct selector
-            const allButtons = await page.evaluate(() =>
-                Array.from(document.querySelectorAll('button, tp-yt-paper-button, yt-button-renderer'))
-                    .map(el => ({ tag: el.tagName, id: el.id, text: el.innerText?.slice(0, 50), aria: el.getAttribute('aria-label') }))
-                    .filter(b => b.text || b.aria)
-                    .slice(0, 30)
+            // Dump all tp-yt-paper-button elements for debugging
+            const paperBtns = await page.evaluate(() =>
+                Array.from(document.querySelectorAll('tp-yt-paper-button, yt-button-renderer'))
+                    .map(el => ({ tag: el.tagName, id: el.id, text: el.textContent?.trim().slice(0, 40) }))
+                    .filter(b => b.text)
+                    .slice(0, 40)
             );
-            reqLog.info('All buttons found on page:', { buttons: JSON.stringify(allButtons) });
+            L.info('tp-yt-paper-buttons on page:', { btns: JSON.stringify(paperBtns) });
             await pushResult(handle, channelUrl, null, 'popup-not-opened');
             return;
         }
 
-        // ── 5. Click "View email address" ────────────────────────────────────
-        const emailBtnLocators = [
-            page.getByRole('button', { name: /view email address/i }),
-            page.getByText('View email address', { exact: true }),
-            page.locator('yt-button-renderer:has-text("View email address")'),
-            page.locator('button:has-text("View email address")'),
-            page.locator('[aria-label*="View email" i]'),
-        ];
+        // ── Click "View email address" via JS ────────────────────────────────
+        const emailBtnClicked = await page.evaluate(async () => {
+            const wait = (ms) => new Promise(r => setTimeout(r, ms));
+            const all = Array.from(document.querySelectorAll('*'));
 
-        let emailBtnClicked = false;
-        for (const loc of emailBtnLocators) {
-            try {
-                if (await loc.first().isVisible({ timeout: 3000 })) {
-                    await loc.first().click({ timeout: 5000 });
-                    reqLog.info('✅ Clicked "View email address"');
-                    emailBtnClicked = true;
-                    await sleep(2500);
-                    break;
+            for (const el of all) {
+                const text = (el.innerText || el.textContent || '').toLowerCase().trim();
+                if (text === 'view email address' || text.includes('view email address')) {
+                    try {
+                        el.scrollIntoView({ block: 'center' });
+                        await wait(300);
+                        el.click();
+                        return el.tagName + '#' + el.id;
+                    } catch (_) {}
                 }
-            } catch (_) {}
-        }
+            }
+            return null;
+        });
 
-        await saveDebugScreenshot(page, `${ch}-03-after-email-btn`);
+        L.info(emailBtnClicked ? `✅ Clicked email btn (${emailBtnClicked})` : '❌ Email button not found');
+        await snap(page, `${ch}-03-email-btn`);
 
         if (!emailBtnClicked) {
-            reqLog.warning(`❌ "View email address" button not clickable for @${ch}`);
             await pushResult(handle, channelUrl, null, 'email-button-not-found');
             return;
         }
 
-        // ── 6. Handle reCAPTCHA ───────────────────────────────────────────────
-        const captchaPresent = await page
-            .locator('iframe[src*="recaptcha"]').first()
-            .isVisible({ timeout: 4000 }).catch(() => false);
+        await sleep(2500);
+
+        // ── Handle reCAPTCHA ─────────────────────────────────────────────────
+        const captchaPresent = await page.locator('iframe[src*="recaptcha"]').first().isVisible({ timeout: 4000 }).catch(() => false);
 
         if (captchaPresent) {
-            reqLog.info('reCAPTCHA detected — trying checkbox click...');
-            const captchaFrame = page.frameLocator('iframe[src*="recaptcha"]').first();
+            L.info('reCAPTCHA detected — trying checkbox click...');
+            const frame = page.frameLocator('iframe[src*="recaptcha"]').first();
             try {
-                await captchaFrame.locator('#recaptcha-anchor').click({ timeout: 5000 });
+                await frame.locator('#recaptcha-anchor').click({ timeout: 5000 });
                 await sleep(3500);
-                const passed = await captchaFrame
-                    .locator('#recaptcha-anchor[aria-checked="true"]')
-                    .isVisible({ timeout: 4000 }).catch(() => false);
+                const passed = await frame.locator('#recaptcha-anchor[aria-checked="true"]').isVisible({ timeout: 4000 }).catch(() => false);
 
                 if (passed) {
-                    reqLog.info('✅ reCAPTCHA checkbox passed!');
+                    L.info('✅ reCAPTCHA passed!');
                     await page.locator('button:has-text("Submit"), input[type="submit"]').first().click({ timeout: 5000 }).catch(() => null);
                     await sleep(3000);
                 } else if (twoCaptchaApiKey) {
                     const token = await solveWith2Captcha(page, twoCaptchaApiKey);
                     if (token) {
-                        await injectCaptchaToken(page, token);
+                        await page.evaluate((t) => {
+                            const area = document.querySelector('#g-recaptcha-response');
+                            if (area) { Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set.call(area, t); area.dispatchEvent(new Event('input', { bubbles: true })); }
+                            try {
+                                if (window.___grecaptcha_cfg?.clients) {
+                                    const find = (obj, d = 0) => { if (d > 5 || !obj || typeof obj !== 'object') return null; for (const k of Object.keys(obj)) { if (k === 'callback' && typeof obj[k] === 'function') return obj[k]; const f = find(obj[k], d + 1); if (f) return f; } return null; };
+                                    for (const ck of Object.keys(window.___grecaptcha_cfg.clients)) { const cb = find(window.___grecaptcha_cfg.clients[ck]); if (cb) { cb(t); return; } }
+                                }
+                            } catch (_) {}
+                        }, token);
                         await sleep(1500);
                         await page.locator('button:has-text("Submit"), input[type="submit"]').first().click({ timeout: 5000 }).catch(() => null);
                         await sleep(3000);
                     }
                 } else {
-                    reqLog.warning('Image challenge shown — add "twoCaptchaApiKey" to solve automatically');
+                    L.warning('Image challenge shown — add "twoCaptchaApiKey" to input');
                 }
-            } catch (err) {
-                reqLog.warning('CAPTCHA interaction error:', { message: err.message });
-            }
+            } catch (err) { L.warning('CAPTCHA error:', { message: err.message }); }
         } else {
-            reqLog.info('No reCAPTCHA — email may appear directly');
+            L.info('No reCAPTCHA — email may appear directly');
             await sleep(2000);
         }
 
-        await saveDebugScreenshot(page, `${ch}-04-after-captcha`);
+        await snap(page, `${ch}-04-after-captcha`);
 
-        // ── 7. Extract email ──────────────────────────────────────────────────
-        let domEmail = null;
+        // ── Extract email ────────────────────────────────────────────────────
         const bodyText = await page.evaluate(() => document.body.innerText);
-        const m = bodyText.match(
-            /[a-zA-Z0-9._%+\-]+@(?!youtube\.|google\.|gstatic\.|googleapis\.|w3\.|schema\.|gzip\.|example\.)[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/
-        );
-        if (m) domEmail = m[0];
-
+        const m = bodyText.match(/[a-zA-Z0-9._%+\-]+@(?!youtube\.|google\.|gstatic\.|googleapis\.|w3\.|schema\.|gzip\.|example\.)[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
+        const domEmail = m?.[0] ?? null;
         const finalEmail = interceptedEmail ?? domEmail;
 
-        if (finalEmail) reqLog.info(`✅ Email for @${ch}: ${finalEmail}`);
-        else reqLog.warning(`❌ No email found for @${ch}`);
-
+        L.info(finalEmail ? `✅ Email: ${finalEmail}` : `❌ No email found`);
         await pushResult(handle, channelUrl, finalEmail, finalEmail ? 'success' : 'email-not-found');
         await sleep(delayBetweenRequests);
     },
@@ -376,7 +287,7 @@ const requests = channelHandles.map((handle) => ({
     uniqueKey: `yt-email-${cleanHandle(handle)}`,
 }));
 
-log.info(`Starting scrape of ${requests.length} channel(s)...`);
+log.info(`Scraping ${requests.length} channel(s)...`);
 await crawler.run(requests);
-log.info('Done! Check Dataset for results and Key-Value Store for screenshots.');
+log.info('Done! Check Dataset + Key-Value Store (screenshots).');
 await Actor.exit();
