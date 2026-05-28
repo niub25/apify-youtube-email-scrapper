@@ -1,0 +1,51 @@
+{
+  "title": "YouTube Channel Email Scraper Input",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "channelHandles": {
+      "title": "Channel Handles",
+      "type": "array",
+      "description": "List of YouTube channel handles to scrape (e.g. ['@Drberg', '@MrBeast']). Include or omit the @ — both work.",
+      "editor": "stringList",
+      "prefill": ["@Drberg"]
+    },
+    "cookies": {
+      "title": "YouTube Session Cookies",
+      "type": "array",
+      "description": "Your YouTube/Google session cookies as a JSON array. Required to see the 'View email address' button. Export from browser DevTools → Application → Cookies → youtube.com. Must include at minimum: SID, HSID, SSID, APISID, SAPISID, __Secure-1PSID, __Secure-3PSID.",
+      "editor": "json",
+      "prefill": []
+    },
+    "twoCaptchaApiKey": {
+      "title": "2Captcha API Key (optional)",
+      "type": "string",
+      "description": "API key from 2captcha.com to auto-solve the reCAPTCHA if the simple checkbox click fails. Get one at https://2captcha.com. Leave empty to attempt checkbox-only solving (works ~70% of the time with a real logged-in session).",
+      "editor": "textfield",
+      "default": ""
+    },
+    "proxyConfiguration": {
+      "title": "Proxy Configuration",
+      "type": "object",
+      "description": "Optional proxy configuration. Using Apify residential proxies greatly improves reCAPTCHA pass rates.",
+      "editor": "proxy",
+      "prefill": { "useApifyProxy": false }
+    },
+    "maxConcurrency": {
+      "title": "Max Concurrency",
+      "type": "integer",
+      "description": "How many channels to process simultaneously. Keep at 1–2 to avoid triggering YouTube's bot detection.",
+      "default": 1,
+      "minimum": 1,
+      "maximum": 5
+    },
+    "delayBetweenRequests": {
+      "title": "Delay Between Requests (ms)",
+      "type": "integer",
+      "description": "Milliseconds to wait between processing each channel. A small delay mimics human behaviour.",
+      "default": 2000,
+      "minimum": 500
+    }
+  },
+  "required": ["channelHandles", "cookies"]
+}
