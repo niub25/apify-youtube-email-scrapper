@@ -80,7 +80,13 @@ async function injectCaptchaToken(page, token) {
 }
 
 async function pushResult(handle, channelUrl, email, status) {
-    await Dataset.pushData({ handle: `@${cleanHandle(handle)}`, channelUrl, email, status, scrapedAt: new Date().toISOString() });
+    await Dataset.pushData({
+        handle: `@${cleanHandle(handle)}`,
+        channelUrl,
+        email,
+        status,
+        scrapedAt: new Date().toISOString(),
+    });
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -100,9 +106,19 @@ const {
 if (!channelHandles.length) throw new Error('"channelHandles" is empty');
 if (!cookies.length) log.warning('No cookies — email button only shows to logged-in users');
 
-const proxyConfiguration = proxyConfigInput ? await Actor.createProxyConfiguration(proxyConfigInput) : undefined;
+const proxyConfiguration = proxyConfigInput
+    ? await Actor.createProxyConfiguration(proxyConfigInput)
+    : undefined;
 
-const sameSiteMap = { no_restriction: 'None', lax: 'Lax', strict: 'Strict', unspecified: 'Lax', '': 'Lax' };
+const sameSiteMap = {
+    no_restriction: 'None',
+    lax: 'Lax',
+    strict: 'Strict',
+    unspecified: 'Lax',
+    '': 'Lax',
+};
+
+// ─── Crawler ─────────────────────────────────────────────────────────────────
 
 const crawler = new PlaywrightCrawler({
     proxyConfiguration,
@@ -122,12 +138,23 @@ const crawler = new PlaywrightCrawler({
         useChrome: Actor.isAtHome(),
         launchOptions: {
             headless: true,
-            args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage', '--window-size=1280,800'],
+            args: [
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--window-size=1280,800',
+            ],
         },
     },
+
     browserPoolOptions: {
         useFingerprints: true,
-        fingerprintOptions: { fingerprintGeneratorOptions: { browsers: ['chrome'], operatingSystems: ['windows', 'macos'] } },
+        fingerprintOptions: {
+            fingerprintGeneratorOptions: {
+                browsers: ['chrome'],
+                operatingSystems: ['windows', 'macos'],
+            },
+        },
     },
 
     async requestHandler({ page, request, log: reqLog }) {
@@ -140,15 +167,23 @@ const crawler = new PlaywrightCrawler({
         if (cookies.length) {
             const normalised = cookies.map((c) => {
                 const raw = (c.sameSite ?? '').toLowerCase();
-                const sameSite = sameSiteMap[raw] ?? (['Strict', 'Lax', 'None'].includes(c.sameSite) ? c.sameSite : 'None');
-                return { name: c.name, value: c.value, domain: c.domain ?? '.youtube.com', path: c.path ?? '/', secure: c.secure ?? true, httpOnly: c.httpOnly ?? false, sameSite };
+                const sameSite = sameSiteMap[raw] ??
+                    (['Strict', 'Lax', 'None'].includes(c.sameSite) ? c.sameSite : 'None');
+                return {
+                    name: c.name,
+                    value: c.value,
+                    domain: c.domain ?? '.youtube.com',
+                    path: c.path ?? '/',
+                    secure: c.secure ?? true,
+                    httpOnly: c.httpOnly ?? false,
+                    sameSite,
+                };
             });
             await page.context().addCookies(normalised);
             reqLog.info(`Injected ${normalised.length} cookies`);
         }
 
-        // ── 2. Passive network monitor ────────────────────────────────────────
-        // Listen to YouTube API responses only — no re-fetching, no timeouts
+        // ── 2. Passive network monitor (YouTube API responses only) ──────────
         let interceptedEmail = null;
         page.on('response', async (response) => {
             try {
@@ -158,13 +193,18 @@ const crawler = new PlaywrightCrawler({
                 if (!ct.includes('application/json')) return;
                 const body = await response.text().catch(() => '');
                 if (interceptedEmail || !body.includes('@')) return;
-                const m = body.match(/[a-zA-Z0-9._%+\-]+@(?!youtube\.|google\.|gstatic\.|googleapis\.|w3\.|schema\.|gzip\.|example\.|sentry\.)[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
-                if (m) { interceptedEmail = m[0]; reqLog.info(`📡 Intercepted email from API: ${interceptedEmail}`); }
+                const m = body.match(
+                    /[a-zA-Z0-9._%+\-]+@(?!youtube\.|google\.|gstatic\.|googleapis\.|w3\.|schema\.|gzip\.|example\.|sentry\.)[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/
+                );
+                if (m) {
+                    interceptedEmail = m[0];
+                    reqLog.info(`📡 Intercepted email from API: ${interceptedEmail}`);
+                }
             } catch (_) {}
         });
 
-        // ── 3. Navigate ───────────────────────────────────────────────────────
-        await page.goto(channelUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+        // ── 3. Re-navigate with cookies now active ───────────────────────────
+        await page.goto(channelUrl, { waitUntil: 'domcontentloaded', timeout: 120_000 });
         await sleep(3000);
 
         const isLoggedIn = await page.evaluate(() =>
@@ -175,29 +215,18 @@ const crawler = new PlaywrightCrawler({
         await saveDebugScreenshot(page, `${ch}-01-after-load`);
 
         // ── 4. Open the channel info popup ────────────────────────────────────
-        //
-        // YouTube shows the info popup (with "View email address") when you click
-        // on specific areas of the channel header. We try many selectors in order.
-        //
         const panelTriggers = [
-            // 2024-2026 YouTube UI — metadata row
             'ytd-channel-about-metadata-renderer',
             '#channel-header-container #channel-handle',
-            // Subscriber count area
             '#subscriber-count',
             'yt-formatted-string#subscriber-count',
-            // Channel name
             '#channel-name yt-formatted-string#text',
             'ytd-channel-name #text',
-            // Inner header
             '#inner-header-container',
-            // Links / external link section (clicking here sometimes opens popup)
             '#links-section',
             '#link-list-container',
-            // Tagline
             '#channel-tagline',
             'ytd-channel-tagline-renderer',
-            // About tab
             'a[tab-title="About"]',
             'tp-yt-paper-tab:has-text("About")',
             'yt-tab-shape:has-text("About")',
@@ -210,8 +239,11 @@ const crawler = new PlaywrightCrawler({
                 if (await el.isVisible({ timeout: 1500 })) {
                     await el.click({ timeout: 3000 });
                     await sleep(2000);
-                    // Check if the popup appeared (contains "View email" or "More info")
-                    const popupVisible = await page.locator('text=View email address, text=More info').first().isVisible({ timeout: 2000 }).catch(() => false);
+                    const popupVisible = await page
+                        .locator('text=View email address, text=More info')
+                        .first()
+                        .isVisible({ timeout: 2000 })
+                        .catch(() => false);
                     if (popupVisible) {
                         reqLog.info(`✅ Info panel opened via: ${sel}`);
                         panelOpened = true;
@@ -225,12 +257,12 @@ const crawler = new PlaywrightCrawler({
 
         if (!panelOpened) {
             reqLog.info('Panel not opened via header — trying /about sub-page...');
-            await page.goto(`${channelUrl}/about`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+            await page.goto(`${channelUrl}/about`, { waitUntil: 'domcontentloaded', timeout: 120_000 });
             await sleep(3000);
             await saveDebugScreenshot(page, `${ch}-03-about-page`);
         }
 
-        // ── 5. Find "View email address" button ───────────────────────────────
+        // ── 5. Find and click "View email address" button ─────────────────────
         const emailBtnLocators = [
             page.getByRole('button', { name: /view email address/i }),
             page.getByText('View email address', { exact: true }),
@@ -258,7 +290,6 @@ const crawler = new PlaywrightCrawler({
 
         if (!emailBtnClicked) {
             reqLog.warning(`❌ "View email address" button not found for @${ch}`);
-            // Log all visible text to help debug selector issues
             const visibleText = await page.evaluate(() => document.body.innerText.slice(0, 2000));
             reqLog.info('Page text snapshot:', { text: visibleText });
             await pushResult(handle, channelUrl, null, 'email-button-not-found');
@@ -266,7 +297,11 @@ const crawler = new PlaywrightCrawler({
         }
 
         // ── 6. Handle reCAPTCHA ───────────────────────────────────────────────
-        const captchaPresent = await page.locator('iframe[src*="recaptcha"]').first().isVisible({ timeout: 4000 }).catch(() => false);
+        const captchaPresent = await page
+            .locator('iframe[src*="recaptcha"]')
+            .first()
+            .isVisible({ timeout: 4000 })
+            .catch(() => false);
 
         if (captchaPresent) {
             reqLog.info('reCAPTCHA detected — trying checkbox click...');
@@ -274,7 +309,10 @@ const crawler = new PlaywrightCrawler({
             try {
                 await captchaFrame.locator('#recaptcha-anchor').click({ timeout: 5000 });
                 await sleep(3500);
-                const passed = await captchaFrame.locator('#recaptcha-anchor[aria-checked="true"]').isVisible({ timeout: 4000 }).catch(() => false);
+                const passed = await captchaFrame
+                    .locator('#recaptcha-anchor[aria-checked="true"]')
+                    .isVisible({ timeout: 4000 })
+                    .catch(() => false);
 
                 if (passed) {
                     reqLog.info('✅ reCAPTCHA checkbox passed!');
@@ -289,7 +327,7 @@ const crawler = new PlaywrightCrawler({
                         await sleep(3000);
                     }
                 } else {
-                    reqLog.warning('Image challenge shown — add "twoCaptchaApiKey" to solve automatically');
+                    reqLog.warning('Image challenge shown — add "twoCaptchaApiKey" to input to solve automatically');
                 }
             } catch (err) {
                 reqLog.warning('CAPTCHA interaction error:', { message: err.message });
@@ -301,10 +339,12 @@ const crawler = new PlaywrightCrawler({
 
         await saveDebugScreenshot(page, `${ch}-05-after-captcha`);
 
-        // ── 7. Extract email ──────────────────────────────────────────────────
+        // ── 7. Extract email from DOM ─────────────────────────────────────────
         let domEmail = null;
         const bodyText = await page.evaluate(() => document.body.innerText);
-        const m = bodyText.match(/[a-zA-Z0-9._%+\-]+@(?!youtube\.|google\.|gstatic\.|googleapis\.|w3\.|schema\.|gzip\.|example\.)[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
+        const m = bodyText.match(
+            /[a-zA-Z0-9._%+\-]+@(?!youtube\.|google\.|gstatic\.|googleapis\.|w3\.|schema\.|gzip\.|example\.)[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/
+        );
         if (m) domEmail = m[0];
 
         const finalEmail = interceptedEmail ?? domEmail;
@@ -318,9 +358,16 @@ const crawler = new PlaywrightCrawler({
 
     failedRequestHandler({ request }) {
         const { handle } = request.userData;
-        return pushResult(handle, `https://www.youtube.com/@${cleanHandle(handle)}`, null, 'request-failed');
+        return pushResult(
+            handle,
+            `https://www.youtube.com/@${cleanHandle(handle)}`,
+            null,
+            'request-failed'
+        );
     },
 });
+
+// ─── Run ─────────────────────────────────────────────────────────────────────
 
 const requests = channelHandles.map((handle) => ({
     url: `https://www.youtube.com/@${cleanHandle(handle)}`,
