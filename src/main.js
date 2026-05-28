@@ -147,18 +147,18 @@ const crawler = new PlaywrightCrawler({
             await wait(1000);
 
             const candidates = [
-                // Primary: the expand button in the channel description
-                document.querySelector('ytd-text-inline-expander #expand'),
-                document.querySelector('ytd-text-inline-expander tp-yt-paper-button'),
-                document.querySelector('#description-container #expand'),
-                document.querySelector('tp-yt-paper-button#expand'),
-                // The channel metadata renderer itself sometimes triggers the popup
-                document.querySelector('ytd-channel-about-metadata-renderer'),
-                // Any element containing "more" text in the description area
-                ...Array.from(document.querySelectorAll('tp-yt-paper-button')).filter(el =>
-                    el.textContent.toLowerCase().includes('more') && el.offsetParent !== null
-                ),
-            ].filter(Boolean);
+    // ✅ Confirmed selector from debug log
+    document.querySelector('tp-yt-paper-button#more'),
+    document.querySelector('ytd-text-inline-expander tp-yt-paper-button#more'),
+    // Fallbacks
+    document.querySelector('ytd-text-inline-expander #expand'),
+    document.querySelector('tp-yt-paper-button#expand'),
+    document.querySelector('ytd-channel-about-metadata-renderer'),
+    // Any tp-yt-paper-button with "more" or "Read more" text
+    ...Array.from(document.querySelectorAll('tp-yt-paper-button')).filter(el =>
+        (el.id === 'more' || el.textContent.trim().toLowerCase().includes('read more')) && el.offsetParent !== null
+    ),
+].filter(Boolean);
 
             for (const el of candidates) {
                 try {
