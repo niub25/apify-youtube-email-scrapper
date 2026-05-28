@@ -255,26 +255,29 @@ const normalised = cookies.map((c) => {
         //
         let interceptedEmail = null;
 
-        await page.route('**/*', async (route) => {
-            const response = await route.fetch();
-            try {
-                const ct = response.headers()['content-type'] ?? '';
-                if (ct.includes('application/json') || ct.includes('text/')) {
-                    const body = await response.text();
-                    if (interceptedEmail === null && body.includes('@')) {
-                        // Quick pre-filter before expensive regex
-                        const emailMatch = body.match(
-                            /[a-zA-Z0-9._%+\-]+@(?!youtube|google|gstatic|googleapis|schema|w3)[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/
-                        );
-                        if (emailMatch) {
-                            interceptedEmail = emailMatch[0];
-                            reqLog.info(`📡 Intercepted email from network: ${interceptedEmail}`);
-                        }
-                    }
-                }
-            } catch (_) { /* non-text body — ignore */ }
-            await route.fulfill({ response });
-        });
+// Passively listen to responses — no re-fetching, no timeouts
+page.on('response', async (response) => {
+    try {
+        // Only scan YouTube's internal API calls, skip all static assets
+        const url = response.url();
+        if (!url.includes('youtubei/v1/') && !url.includes('browse') && !url.includes('get_endpoint')) return;
+
+        const ct = response.headers()['content-type'] ?? '';
+        if (!ct.includes('application/json')) return;
+
+        const body = await response.text();
+        if (interceptedEmail !== null || !body.includes('@')) return;
+
+        // Strict email regex — excludes known false positives from JS libraries
+        const emailMatch = body.match(
+            /[a-zA-Z0-9._%+\-]+@(?!youtube\.|google\.|gstatic\.|googleapis\.|w3\.|schema\.|gzip\.|example\.|sentry\.)[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/
+        );
+        if (emailMatch) {
+            interceptedEmail = emailMatch[0];
+            reqLog.info(`📡 Intercepted email from network: ${interceptedEmail}`);
+        }
+    } catch (_) { /* ignore */ }
+});
 
         // ── 3. Navigate ──────────────────────────────────────────────────────
         await page.goto(channelUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
