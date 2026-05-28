@@ -217,15 +217,30 @@ const crawler = new PlaywrightCrawler({
 
         // ── 1. Inject cookies so we're "logged in" ───────────────────────────
         if (cookies.length) {
-            const normalised = cookies.map((c) => ({
-                name: c.name,
-                value: c.value,
-                domain: c.domain ?? '.youtube.com',
-                path: c.path ?? '/',
-                secure: c.secure ?? true,
-                httpOnly: c.httpOnly ?? false,
-                sameSite: c.sameSite ?? 'None',
-            }));
+            // Map browser export sameSite values → Playwright accepted values
+const sameSiteMap = {
+    'no_restriction': 'None',
+    'lax': 'Lax',
+    'strict': 'Strict',
+    'unspecified': 'Lax',
+    '': 'Lax',
+};
+
+const normalised = cookies.map((c) => {
+    const raw = (c.sameSite ?? '').toLowerCase();
+    const sameSite = sameSiteMap[raw] ?? (
+        ['Strict', 'Lax', 'None'].includes(c.sameSite) ? c.sameSite : 'None'
+    );
+    return {
+        name: c.name,
+        value: c.value,
+        domain: c.domain ?? '.youtube.com',
+        path: c.path ?? '/',
+        secure: c.secure ?? true,
+        httpOnly: c.httpOnly ?? false,
+        sameSite,
+    };
+});
             await page.context().addCookies(normalised);
             reqLog.info(`Injected ${normalised.length} cookies`);
         }
