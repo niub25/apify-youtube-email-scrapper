@@ -107,6 +107,17 @@ const sameSiteMap = { no_restriction: 'None', lax: 'Lax', strict: 'Strict', unsp
 const crawler = new PlaywrightCrawler({
     proxyConfiguration,
     maxConcurrency,
+    navigationTimeoutSecs: 120,
+    requestHandlerTimeoutSecs: 300,
+
+    // Force domcontentloaded — YouTube never fires the 'load' event cleanly
+    preNavigationHooks: [
+        async (_ctx, gotoOptions) => {
+            gotoOptions.waitUntil = 'domcontentloaded';
+            gotoOptions.timeout = 120_000;
+        },
+    ],
+
     launchContext: {
         useChrome: Actor.isAtHome(),
         launchOptions: {
